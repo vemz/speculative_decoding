@@ -1,0 +1,4 @@
+/presentation
+*.pyc
+*.json
+speculative_demo.py
