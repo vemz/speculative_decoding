@@ -5,6 +5,7 @@ import time
 import urllib.request
 from pathlib import Path
 import modal
+import os
 
 app = modal.App("spec-bench")
 cache = modal.Volume.from_name("hf-cache", create_if_missing=True)
@@ -25,13 +26,6 @@ def vllm_base():
     )
 
 std_image = vllm_base().pip_install("flashmap[vllm]").add_local_dir("DCOCO", "/root/DCOCO")
-dflash2_image = (
-    vllm_base()
-    .apt_install("git")
-    .env({"VLLM_USE_PRECOMPILED": "1"})
-    .pip_install("vllm @ git+https://github.com/vllm-project/vllm.git@refs/pull/52816/head")
-    .add_local_dir("DCOCO", "/root/DCOCO")
-)
 dcoco_image = (
     modal.Image.from_dockerfile("DCOCO/docker/Dockerfile", context_dir="DCOCO/docker")
     .dockerfile_commands([PYTHON])
@@ -45,18 +39,21 @@ RUNS = {
         "dflash":   ("std",   {"method": "dflash", "model": "z-lab/Qwen3-8B-DFlash-b16", "num_speculative_tokens": 15}),
         "dcoco":    ("dcoco", {"method": "dflash", "model": "TD-Labs/Qwen3-8B-DCOCO", "num_speculative_tokens": 15}),
         "flashmap": ("std",   {"model": "j-shen/FlashMap-Qwen3-8B", "num_speculative_tokens": 16}),
+        "flashmap2": ("std",  {"model": "j-shen/FlashMap-Qwen3-8B", "num_speculative_tokens": 16, "_env": {"FLASHMAP_NUM_STEPS": "2"}}),
     }),
     "4b": ("Qwen/Qwen3-4B", {
         "dflash":   ("std",     {"method": "dflash", "model": "z-lab/Qwen3-4B-DFlash-b16", "num_speculative_tokens": 15}),
-        "dflash2":  ("dflash2", {"method": "dflash2", "model": "RedHatAI/Qwen3-4B-speculator.dflash2", "num_speculative_tokens": 8}),
         "dcoco":    ("dcoco",   {"method": "dflash", "model": "TD-Labs/Qwen3-4B-DCOCO", "num_speculative_tokens": 15}),
         "flashmap": ("std",     {"model": "j-shen/FlashMap-Qwen3-4B", "num_speculative_tokens": 16}),
+        "flashmap2": ("std",  {"model": "j-shen/FlashMap-Qwen3-4B", "num_speculative_tokens": 16, "_env": {"FLASHMAP_NUM_STEPS": "2"}}),
     }),
 }
 
-def wait_until_up(url, timeout=1800):
+def wait_until_up(url, server, timeout=1800):
     start = time.time()
     while time.time() - start < timeout:
+        if server.poll() is not None:
+            raise RuntimeError(f"le serveur vLLM s'est arrêté (code {server.returncode}), voir les logs au-dessus")
         try:
             urllib.request.urlopen(url)
             return
@@ -76,11 +73,13 @@ def parse_table(text):
     return results
 
 def bench(target, spec, rows):
+    spec = dict(spec or {})
+    env = {**os.environ, **spec.pop("_env", {})}  
     cmd = ["vllm", "serve", target, "--max-model-len", "8192", "--port", "8000"]
     if spec:
         cmd += ["--speculative-config", json.dumps(spec)]
-    server = subprocess.Popen(cmd)
-    wait_until_up("http://localhost:8000/health")
+    server = subprocess.Popen(cmd, env=env)
+    wait_until_up("http://localhost:8000/health", server)
 
     out = subprocess.run(
         ["python", "/root/DCOCO/scripts/benchmark.py", "--endpoint", "http://localhost:8000", "--out", "/tmp/out",
@@ -100,15 +99,11 @@ GPU = dict(gpu="H200", volumes={"/cache": cache}, timeout=4 * 3600)
 def run_std(*args):
     return bench(*args)
 
-@app.function(image=dflash2_image, **GPU)
-def run_dflash2(*args):
-    return bench(*args)
-
 @app.function(image=dcoco_image, **GPU)
 def run_dcoco(*args):
     return bench(*args)
 
-RUNNERS = {"std": run_std, "dflash2": run_dflash2, "dcoco": run_dcoco}
+RUNNERS = {"std": run_std, "dcoco": run_dcoco}
 
 @app.local_entrypoint()
 def main(model: str = "8b", rows: int = 80, k: int = 0, only: str = ""):
