@@ -1,11 +1,11 @@
 import csv
 import json
+import os
 import subprocess
 import time
 import urllib.request
 from pathlib import Path
 import modal
-import os
 
 app = modal.App("spec-bench")
 cache = modal.Volume.from_name("hf-cache", create_if_missing=True)
@@ -14,7 +14,7 @@ BENCHMARKS = ["gsm8k", "humaneval", "mt-bench"]
 
 ENV = {"HF_HOME": "/cache", "VLLM_USE_FLASHINFER_SAMPLER": "0"}
 PYTHON = "RUN ln -sf $(command -v python3) /usr/local/bin/python"
-BENCH_DEPS = ["pandas", "datasets", "matplotlib", "seaborn", "scipy"] 
+BENCH_DEPS = ["pandas", "datasets", "matplotlib", "seaborn", "scipy"]  
 
 def vllm_base():
     return (
@@ -45,7 +45,7 @@ RUNS = {
         "dflash":   ("std",     {"method": "dflash", "model": "z-lab/Qwen3-4B-DFlash-b16", "num_speculative_tokens": 15}),
         "dcoco":    ("dcoco",   {"method": "dflash", "model": "TD-Labs/Qwen3-4B-DCOCO", "num_speculative_tokens": 15}),
         "flashmap": ("std",     {"model": "j-shen/FlashMap-Qwen3-4B", "num_speculative_tokens": 16}),
-        "flashmap2": ("std",  {"model": "j-shen/FlashMap-Qwen3-4B", "num_speculative_tokens": 16, "_env": {"FLASHMAP_NUM_STEPS": "2"}}),
+        "flashmap2": ("std",    {"model": "j-shen/FlashMap-Qwen3-4B", "num_speculative_tokens": 16, "_env": {"FLASHMAP_NUM_STEPS": "2"}}),
     }),
 }
 
@@ -72,26 +72,34 @@ def parse_table(text):
             }
     return results
 
-def bench(target, spec, rows):
+def bench(target, spec, rows, concurrencies):
     spec = dict(spec or {})
-    env = {**os.environ, **spec.pop("_env", {})}  
+    env = {**os.environ, **spec.pop("_env", {})}  # ex. FLASHMAP_NUM_STEPS=2 pour FlashMap à 2 pas
     cmd = ["vllm", "serve", target, "--max-model-len", "8192", "--port", "8000"]
     if spec:
         cmd += ["--speculative-config", json.dumps(spec)]
     server = subprocess.Popen(cmd, env=env)
     wait_until_up("http://localhost:8000/health", server)
 
-    out = subprocess.run(
-        ["python", "/root/DCOCO/scripts/benchmark.py", "--endpoint", "http://localhost:8000", "--out", "/tmp/out",
-         "--datasets", *BENCHMARKS, "--configs", "t0", "--rows", str(rows), "--vllm-bin", "vllm"],
-        capture_output=True, text=True,
-    )
-    print(out.stdout, out.stderr, flush=True)
+    def run(out_dir, n, c):
+        return subprocess.run(
+            ["python", "/root/DCOCO/scripts/benchmark.py", "--endpoint", "http://localhost:8000", "--out", out_dir,
+             "--datasets", *BENCHMARKS, "--configs", "t0", "--rows", str(n), "--vllm-bin", "vllm",
+             "--concurrency", str(c)],
+            capture_output=True, text=True,
+        )
+
+    results = {}
+    for c in concurrencies: 
+        run(f"/tmp/warmup_c{c}", max(8, 2 * c), c)  
+        out = run("/tmp/out", rows, c)
+        print(out.stdout, out.stderr, flush=True)
+        results[c] = parse_table(out.stdout + out.stderr)
     for log in Path("/tmp/out").rglob("*.log"):
         print(f"--- {log} ---\n" + "\n".join(log.read_text().splitlines()[-30:]), flush=True)
     server.terminate()
     cache.commit()
-    return parse_table(out.stdout + out.stderr)
+    return results
 
 GPU = dict(gpu="H200", volumes={"/cache": cache}, timeout=4 * 3600)
 
@@ -106,8 +114,9 @@ def run_dcoco(*args):
 RUNNERS = {"std": run_std, "dcoco": run_dcoco}
 
 @app.local_entrypoint()
-def main(model: str = "8b", rows: int = 80, k: int = 0, only: str = ""):
+def main(model: str = "8b", rows: int = 80, k: int = 0, only: str = "", concurrency: str = "1"):
     target, methods = RUNS[model]
+    concurrencies = [int(c) for c in concurrency.split(",")]
     if only:
         methods = {m: v for m, v in methods.items() if m in only.split(",")}
 
@@ -117,7 +126,7 @@ def main(model: str = "8b", rows: int = 80, k: int = 0, only: str = ""):
             spec = {**spec, "num_speculative_tokens": k}
         jobs.append((name, image, spec))
 
-    handles = [(name, image, RUNNERS[image].spawn(target, spec, rows)) for name, image, spec in jobs]
+    handles = [(name, image, RUNNERS[image].spawn(target, spec, rows, concurrencies)) for name, image, spec in jobs]
     results = {}
     for name, image, h in handles:
         try:
@@ -126,27 +135,28 @@ def main(model: str = "8b", rows: int = 80, k: int = 0, only: str = ""):
             print(f"\n✗ {name} ({image}) a échoué : {e}\n")
 
     table = []
-    for (name, image), res in results.items():
-        base = results.get(("no-spec", image), {})
-        for bench_name, r in res.items():
-            if bench_name in base:
-                table.append({
-                    "model": model, "method": name, "image": image, "benchmark": bench_name,
-                    "gamma": round(r["gamma"], 2), "tok_s": round(r["tok_s"], 1),
-                    "speedup": round(r["tok_s"] / base[bench_name]["tok_s"], 2),
-                })
+    for (name, image), by_c in results.items():
+        for c, res in by_c.items():
+            base = results.get(("no-spec", image), {}).get(c, {})
+            for bench_name, r in res.items():
+                if bench_name in base:
+                    table.append({
+                        "model": model, "method": name, "image": image, "concurrency": c, "benchmark": bench_name,
+                        "gamma": round(r["gamma"], 2), "tok_s": round(r["tok_s"], 1),
+                        "speedup": round(r["tok_s"] / base[bench_name]["tok_s"], 2),
+                    })
 
     if not table:
         print("aucun résultat")
         return
 
-    path = f"bench_{model}_k{k or 'natif'}.csv"
+    path = f"bench_{model}_k{k or 'natif'}_c{concurrency.replace(',', '-')}.csv"
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=table[0].keys())
         w.writeheader()
         w.writerows(table)
 
-    print(f"\n{'méthode':<10}{'image':<9}{'benchmark':<11}{'γ':>6}{'tok/s':>9}{'speedup':>9}")
+    print(f"\n{'méthode':<10}{'image':<9}{'c':>4}  {'benchmark':<11}{'γ':>6}{'tok/s':>9}{'speedup':>9}")
     for r in table:
-        print(f"{r['method']:<10}{r['image']:<9}{r['benchmark']:<11}{r['gamma']:>6}{r['tok_s']:>9}{r['speedup']:>9}")
+        print(f"{r['method']:<10}{r['image']:<9}{r['concurrency']:>4}  {r['benchmark']:<11}{r['gamma']:>6}{r['tok_s']:>9}{r['speedup']:>9}")
     print(f"\n→ {path}")
